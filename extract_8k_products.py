@@ -82,6 +82,19 @@ PRODUCT_KEYWORDS = re.compile(
     re.IGNORECASE,
 )
 
+# Name patterns that are corporate events, not products (found in error analysis
+# of the first 100-filing run: share plans, sponsorships, disclosure channels).
+NON_PRODUCT_PATTERN = re.compile(
+    r"\b(plan|agreement|partner(?:ship)?|sponsor\w*|credit facility|notes? due|"
+    r"debentures?|bylaws?|charter|dividend|repurchase|merger|acquisition)\b",
+    re.IGNORECASE,
+)
+# Third-party channels companies name in Reg FD boilerplate ("we post on YouTube").
+DISCLOSURE_CHANNELS = {
+    "youtube", "linkedin", "facebook", "instagram", "x", "twitter", "tiktok",
+    "threads", "bluesky", "investor relations website", "nyse", "nasdaq",
+}
+
 # Names the LLM sometimes returns that are not products.
 GENERIC_NAMES = {
     "", "n/a", "na", "none", "null", "unknown", "product", "products", "the product",
@@ -365,8 +378,12 @@ Rules:
 - A product is a specific, named good, service, drug, device, software, chip, vehicle or platform
   that the filing says is being launched, introduced, released, approved or made available.
 - Use the product name exactly as written in the text.
+- The product must be made or sold BY THE FILING COMPANY. A customer's or partner's
+  product (e.g. the aircraft a supplier's part goes into) is not the company's product.
 - Do NOT include: the company itself, earnings results, acquisitions, executives,
-  financing deals, existing products only mentioned in passing, or generic phrases.
+  financing deals, share or incentive plans, sponsorships or partnerships, websites or
+  social media used for disclosure (YouTube, LinkedIn, X), existing products only
+  mentioned in passing, or generic phrases.
 - Description: one factual sentence, under 180 characters, based only on the text.
 - If there is no new product, return {"products": []}.
 """
@@ -458,6 +475,8 @@ def validate(products: list[dict], source_text: str, company: Company) -> list[d
         n = _norm(name)
         if n in GENERIC_NAMES or len(n) < 2 or n == company_norm:
             continue
+        if n in DISCLOSURE_CHANNELS or NON_PRODUCT_PATTERN.search(name):
+            continue
         if n not in src:                 # hallucination guard
             log.debug("Dropped %r: not found in filing text", name)
             continue
@@ -511,14 +530,57 @@ def process_filing(client: SecClient, filing: Filing, model: str | None) -> tupl
     return records, status
 
 
-def write_outputs(records: list[ProductRecord], log_rows: list[dict], out_dir: Path) -> None:
-    out_dir.mkdir(parents=True, exist_ok=True)
+def clean_records(records: list[ProductRecord]) -> list[ProductRecord]:
+    """Cross-filing clean-up applied after extraction.
 
-    with open(out_dir / "new_products.csv", "w", newline="", encoding="utf-8") as f:
+    1. Drop non-product names (share plans, partnerships, disclosure channels).
+    2. A product a company keeps mentioning in later 8-Ks (e.g. every quarterly
+       earnings release) is only *new* the first time: keep the earliest filing.
+    3. If one name is contained in a longer name for the same company
+       ("Similac" vs "Similac 360 Total Care"), keep the more specific one.
+    """
+    kept = []
+    for r in records:
+        n = _norm(r.new_product)
+        if n in DISCLOSURE_CHANNELS or n in GENERIC_NAMES or NON_PRODUCT_PATTERN.search(r.new_product):
+            continue
+        kept.append(r)
+
+    earliest: dict[tuple[str, str], ProductRecord] = {}
+    for r in sorted(kept, key=lambda r: r.filing_time):
+        key = (r.stock_name, _norm(r.new_product))
+        earliest.setdefault(key, r)
+    kept = list(earliest.values())
+
+    out = []
+    for r in kept:
+        n = _norm(r.new_product)
+        shadowed = any(
+            o is not r and o.stock_name == r.stock_name
+            and len(_norm(o.new_product)) > len(n)
+            and re.search(rf"\b{re.escape(n)}\b", _norm(o.new_product))
+            for o in kept
+        )
+        if not shadowed:
+            out.append(r)
+    out.sort(key=lambda r: (r.stock_name, r.filing_time))
+    return out
+
+
+def _write_csv(path: Path, records: list[ProductRecord]) -> None:
+    with open(path, "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=FIELDNAMES, quoting=csv.QUOTE_ALL)
         w.writeheader()
         for r in records:
             w.writerow(asdict(r))
+
+
+def write_outputs(records: list[ProductRecord], log_rows: list[dict], out_dir: Path) -> None:
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    _write_csv(out_dir / "new_products_raw.csv", records)   # before clean-up
+    records = clean_records(records)
+    _write_csv(out_dir / "new_products.csv", records)        # the deliverable
 
     # Pipe-delimited table in the format shown in the assignment.
     rows = [FIELDNAMES] + [[getattr(r, k) for k in FIELDNAMES] for r in records]
@@ -594,11 +656,24 @@ def main() -> None:
     ap.add_argument("--user-agent", default=DEFAULT_USER_AGENT)
     ap.add_argument("--out", default=str(OUTPUT_DIR))
     ap.add_argument("--no-cache", action="store_true")
+    ap.add_argument("--clean-csv", metavar="RAW_CSV",
+                    help="only re-run the clean-up step on an existing CSV (no SEC/LLM calls)")
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args()
 
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
                         format="%(asctime)s %(levelname)s %(message)s")
+
+    if args.clean_csv:
+        with open(args.clean_csv, encoding="utf-8") as f:
+            records = [ProductRecord(**row) for row in csv.DictReader(f)]
+        out_dir = Path(args.out)
+        log_path = out_dir / "processing_log.csv"
+        log_rows = list(csv.DictReader(open(log_path, encoding="utf-8"))) if log_path.exists() else []
+        write_outputs(records, log_rows, out_dir)
+        log.info("Cleaned %d raw rows -> %d rows in %s", len(records),
+                 len(clean_records(records)), out_dir / "new_products.csv")
+        return
     tickers = args.tickers or (sp500_tickers(args.user_agent) if args.sp500 else SP500_FALLBACK)
     run(tickers, args.per_company, args.max_docs, None if args.no_llm else args.model,
         args.user_agent, Path(args.out), use_cache=not args.no_cache)

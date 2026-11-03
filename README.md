@@ -23,7 +23,8 @@ company_name, stock_name, filing_time, new_product, product_description
 | 6 | spaCy NER tags `ORG` and `PRODUCT` entities | `en_core_web_sm` |
 | 7 | Local LLM returns JSON `{"products":[{"name","description"}]}` with NER entities as hints | Ollama `/api/chat`, `temperature=0`, `format=json` |
 | 8 | Validation: the product name must appear in the filing, generic names and the company name are rejected, descriptions are cut to < 180 characters | |
-| 9 | Write the CSV, a pipe-delimited table, and a processing log | `output/` |
+| 9 | Clean-up across filings: drop non-products (share plans, partnerships, YouTube/LinkedIn disclosure channels), keep only the first filing that mentions a product, keep the more specific of two overlapping names | `clean_records()` |
+| 10 | Write the CSV, a pipe-delimited table, and a processing log | `output/` |
 
 ## Setup
 
@@ -63,11 +64,36 @@ python extract_8k_products.py --sp500 --max-docs 100 --no-llm --out output_ner_b
 
 Files written to `output/`:
 
-- `new_products.csv`: the deliverable (all values quoted)
+- `new_products.csv`: the deliverable (all values quoted, after clean-up)
+- `new_products_raw.csv`: every validated LLM answer, before clean-up
 - `new_products.txt`: the same rows as a `|`-separated table
 - `processing_log.csv`: one row per filing with its status (`ok`, `no_product_language`, `no_product_found`, `skipped_items`, errors), for the report's statistics
 
 Downloads are cached in `cache/`, so a rerun (for example with a different model) doesn't hit the SEC again. Results are checkpointed after each company.
+
+Re-apply only the clean-up step to an existing raw CSV (no SEC or LLM calls):
+
+```bash
+python extract_8k_products.py --clean-csv output/new_products_raw.csv --out output
+```
+
+## Results (submitted run)
+
+`results/` holds the run submitted for the assignment: S&P 500 companies in index order,
+10 most recent 8-Ks each, stopped after 100 analysed filings, `llama3.1` (8B) on an
+Apple-silicon MacBook Air.
+
+| | Count |
+|---|---|
+| Companies queried | 12 |
+| 8-K filings listed | 117 |
+| Skipped by item filter | 17 |
+| Analysed | 100 |
+| No launch language (no LLM call) | 72 |
+| Sent to the LLM | 28 |
+| Filings with at least one product | 8 |
+| Product rows before clean-up (`new_products_raw.csv`) | 22 |
+| Product rows after clean-up (`new_products.csv`) | 13 |
 
 ## Tests
 

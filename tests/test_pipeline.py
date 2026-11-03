@@ -113,3 +113,20 @@ def test_parse_llm_json_deepseek():
 def test_ner_finds_org():
     ents = ex.ner_entities("Apple Inc. has announced the launch of its latest MacBook Pro.")
     assert "Apple Inc." in ents["ORG"]
+
+
+def test_clean_records():
+    R = ex.ProductRecord
+    rows = [
+        R("Abbott", "ABT", "2026-03-23T08:00", "YouTube", "Social media platform"),
+        R("Accenture", "ACN", "2026-01-28T16:00", "2010 Share Incentive Plan", "plan"),
+        R("Aflac", "AFL", "2026-02-04T16:00", "Miraito", "cancer insurance"),
+        R("Aflac", "AFL", "2025-11-04T16:00", "Miraito", "cancer insurance"),
+        R("Abbott", "ABT", "2026-10-21T09:00", "Similac", "formula"),
+        R("Abbott", "ABT", "2026-10-21T07:00", "Similac 360 Total Care", "formula"),
+    ]
+    out = ex.clean_records(rows)
+    assert [(r.stock_name, r.new_product, r.filing_time[:10]) for r in out] == [
+        ("ABT", "Similac 360 Total Care", "2026-10-21"),
+        ("AFL", "Miraito", "2025-11-04"),
+    ]
